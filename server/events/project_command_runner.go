@@ -1156,6 +1156,11 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 	// Hold a read lock for the whole step run so clone/reset/merge cannot run in this dir until we're done.
 	unlock := p.WorkingDir.GitReadLock(ctx.Pull.BaseRepo, ctx.Pull, ctx.Workspace)
 	defer unlock()
+	// The pull request may have been closed and its directory deleted while we
+	// waited for the lock. Running steps now would re-create plan directories.
+	if isPullClosed(ctx.Pull) {
+		return nil, ErrPullClosed
+	}
 
 	envs := make(map[string]string)
 	for _, step := range steps {

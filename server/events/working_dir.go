@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,31 @@ var errInvalidManagedPath = errors.New("invalid managed path")
 
 // gitLocks holds per-clone-dir locks: "repo-lock/<cloneDir>" -> *sync.RWMutex (read for steps, write for clone/reset/merge), "ref-lock/<cloneDir>" -> *sync.Mutex (serialize fetch).
 var gitLocks sync.Map
+
+// ErrPullClosed is returned when a command that started before its pull request
+// was closed tries to use the pull request's working directory after Delete
+// removed it. Re-cloning there would leave a directory nothing deletes again.
+var ErrPullClosed = errors.New("pull request was closed and its working directory deleted")
+
+// closedPulls holds closedPullKey entries for pull requests whose working
+// directory Delete removed and that have not been confirmed open since.
+var closedPulls sync.Map
+
+func closedPullKey(repoFullName string, pullNum int) string {
+	return fmt.Sprintf("%s#%d", repoFullName, pullNum)
+}
+
+// MarkPullOpen allows the working directory of a pull request to be cloned again
+// after Delete. Call it only once the pull request is known to be open, for
+// example when it is reopened.
+func MarkPullOpen(repoFullName string, pullNum int) {
+	closedPulls.Delete(closedPullKey(repoFullName, pullNum))
+}
+
+func isPullClosed(p models.PullRequest) bool {
+	_, closed := closedPulls.Load(closedPullKey(p.BaseRepo.FullName, p.Num))
+	return closed
+}
 
 // pendingMerge coordinates parallel goroutines that all detect divergence at
 // the same time. The leader performs the actual merge while followers wait on
@@ -126,6 +152,9 @@ func (w *FileWorkspace) CheckoutMergeEnabled() bool {
 // the right commit it does nothing. This is to support running commands in
 // multiple dirs of the same repo without deleting existing plans.
 func (w *FileWorkspace) Clone(logger logging.SimpleLogging, headRepo models.Repo, p models.PullRequest, workspace string) (string, error) {
+	if isPullClosed(p) {
+		return "", ErrPullClosed
+	}
 	cloneDir, err := w.validateCloneDir(p.BaseRepo, p, workspace)
 	if err != nil {
 		return "", err
@@ -149,6 +178,11 @@ func (w *FileWorkspace) Clone(logger logging.SimpleLogging, headRepo models.Repo
 	// Acquire write lock for clone/update operations.
 	gitWriteUnlockFn := w.gitWriteLock(cloneDir)
 	defer gitWriteUnlockFn()
+
+	// Delete may have run while we waited for the write lock.
+	if isPullClosed(p) {
+		return "", ErrPullClosed
+	}
 
 	ok, err := w.attemptReuseCloneDir(logger, c, cloneDir)
 	if ok && err == nil {
@@ -247,6 +281,11 @@ func (w *FileWorkspace) MergeAgain(
 		close(pm.done)
 		pendingMerges.Delete(cloneDir)
 	}()
+
+	if isPullClosed(p) {
+		pm.merged, pm.err = false, ErrPullClosed
+		return pm.merged, pm.err
+	}
 
 	logger.Info("base branch may have been updated, using merge strategy and will merge again")
 	pm.merged, pm.err = true, w.mergeAgain(logger, c)
@@ -920,18 +959,109 @@ func (w *FileWorkspace) GetPullDir(r models.Repo, p models.PullRequest) (string,
 }
 
 // Delete deletes the workspace for this repo and pull.
+//
+// For a real pull request (positive number), Delete first marks the pull as
+// closed so that commands already running on it cannot clone it again, then
+// removes the directories while holding the write lock of every workspace, so
+// it never races a clone, merge or step run in the same directories. If a
+// command still holds one of those locks, the removal finishes in the
+// background once the command releases it, and Delete returns nil.
 func (w *FileWorkspace) Delete(logger logging.SimpleLogging, r models.Repo, p models.PullRequest) error {
 	repoPullDir, err := w.repoPullDir(r, p)
 	if err != nil {
 		return err
 	}
-	logger.Info("Deleting repo pull directory: %s", repoPullDir)
-	cloneErr := removeAllSubPath(filepath.Join(w.DataDir, workingDirPrefix), repoPullDir)
-
 	planPullDir, err := w.planPullDir(r, p)
 	if err != nil {
 		return err
 	}
+
+	// Synthetic API pull numbers are negative and unique per request, so they
+	// are never marked: nothing would ever clear the mark.
+	if p.Num > 0 {
+		closedPulls.Store(closedPullKey(r.FullName, p.Num), struct{}{})
+	}
+
+	// Collect the locks only after storing the mark: a clone that registers its
+	// lock later checks the mark once it holds the lock and refuses to run.
+	locks := w.workspaceWriteLocks(repoPullDir)
+	if !tryLockAll(locks) {
+		logger.Info("Waiting for running commands to release %s before deleting it", repoPullDir)
+		go func() {
+			for _, mu := range locks {
+				mu.Lock()
+			}
+			defer unlockAll(locks)
+			if err := w.deletePullDirs(logger, repoPullDir, planPullDir); err != nil {
+				logger.Err("deleting pull directories after running commands finished: %s", err)
+				return
+			}
+			logger.Info("Deleted pull directories after running commands finished")
+		}()
+		return nil
+	}
+	defer unlockAll(locks)
+	return w.deletePullDirs(logger, repoPullDir, planPullDir)
+}
+
+// workspaceWriteLocks returns the repo locks of every workspace in pullDir,
+// sorted by directory so callers always acquire them in the same order. It
+// includes locks registered by a clone that has not created its directory yet.
+func (w *FileWorkspace) workspaceWriteLocks(pullDir string) []*sync.RWMutex {
+	prefix := fmt.Sprintf("repo-lock/%s%c", pullDir, filepath.Separator)
+	dirs := make(map[string]struct{})
+	gitLocks.Range(func(key, _ any) bool {
+		k := key.(string)
+		if strings.HasPrefix(k, prefix) && !strings.ContainsRune(k[len(prefix):], filepath.Separator) {
+			dirs[strings.TrimPrefix(k, "repo-lock/")] = struct{}{}
+		}
+		return true
+	})
+	if entries, err := os.ReadDir(pullDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				dirs[filepath.Join(pullDir, entry.Name())] = struct{}{}
+			}
+		}
+	}
+
+	sorted := make([]string, 0, len(dirs))
+	for dir := range dirs {
+		sorted = append(sorted, dir)
+	}
+	slices.Sort(sorted)
+	locks := make([]*sync.RWMutex, 0, len(sorted))
+	for _, dir := range sorted {
+		value, _ := gitLocks.LoadOrStore(fmt.Sprintf("repo-lock/%s", dir), new(sync.RWMutex))
+		locks = append(locks, value.(*sync.RWMutex))
+	}
+	return locks
+}
+
+// tryLockAll write-locks every lock in order. If one is held, it releases the
+// ones it took and returns false.
+func tryLockAll(locks []*sync.RWMutex) bool {
+	for i, mu := range locks {
+		if !mu.TryLock() {
+			unlockAll(locks[:i])
+			return false
+		}
+	}
+	return true
+}
+
+func unlockAll(locks []*sync.RWMutex) {
+	for _, mu := range locks {
+		mu.Unlock()
+	}
+}
+
+// deletePullDirs removes the clone and plan directories of a pull request.
+// Callers hold the write lock of every workspace in repoPullDir.
+func (w *FileWorkspace) deletePullDirs(logger logging.SimpleLogging, repoPullDir string, planPullDir string) error {
+	logger.Info("Deleting repo pull directory: %s", repoPullDir)
+	cloneErr := removeAllSubPath(filepath.Join(w.DataDir, workingDirPrefix), repoPullDir)
+
 	if filepath.Clean(planPullDir) == filepath.Clean(repoPullDir) {
 		return cloneErr
 	}

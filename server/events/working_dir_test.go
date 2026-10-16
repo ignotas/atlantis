@@ -2420,6 +2420,8 @@ func TestFileWorkspace_DeleteRemovesOnlyManagedSubPaths(t *testing.T) {
 		Num:      1,
 		BaseRepo: repo,
 	}
+	// Delete marks the pull request closed for the whole process.
+	t.Cleanup(func() { events.MarkPullOpen(repo.FullName, pull.Num) })
 
 	defaultWorkspaceDir := filepath.Join(dataDir, "repos", "owner", "repo", "1", "default")
 	otherWorkspaceDir := filepath.Join(dataDir, "repos", "owner", "repo", "1", "other")
@@ -2456,6 +2458,8 @@ func TestFileWorkspace_DeleteRemovesSeparatePlanStorePaths(t *testing.T) {
 		Num:      1,
 		BaseRepo: repo,
 	}
+	// Delete marks the pull request closed for the whole process.
+	t.Cleanup(func() { events.MarkPullOpen(repo.FullName, pull.Num) })
 
 	defaultWorkspaceDir := filepath.Join(dataDir, "repos", "owner", "repo", "1", "default")
 	otherWorkspaceDir := filepath.Join(dataDir, "repos", "owner", "repo", "1", "other")

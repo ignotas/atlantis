@@ -585,6 +585,9 @@ func (e *VCSEventsController) handlePullRequestEvent(logger logging.SimpleLoggin
 	switch eventType {
 	case models.OpenedPullEvent, models.UpdatedPullEvent:
 		// If the pull request was opened or updated, we will try to autoplan.
+		// Clear any closed mark here, not in the autoplan goroutine, so that an
+		// event handled before a close cannot clear the close's mark later.
+		events.MarkPullOpen(baseRepo.FullName, pull.Num)
 
 		// Respond with success and then actually execute the command asynchronously.
 		// We use a goroutine so that this function returns and the connection is

@@ -508,6 +508,11 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
 	if !c.validateCtxAndComment(ctx, cmd.Name, true) {
 		return
 	}
+	// The pull request state was fetched from the VCS host, so a reopened pull
+	// request can use its working directory again.
+	if pull.State == models.OpenPullState {
+		MarkPullOpen(pull.BaseRepo.FullName, pull.Num)
+	}
 
 	cmdRunner := buildCommentCommandRunner(c, cmd.CommandName())
 	targetInitiallyIgnored := shouldSkipPreWorkflowHooks(ctx, cmdRunner, cmd)
